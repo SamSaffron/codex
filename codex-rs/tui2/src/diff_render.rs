@@ -18,15 +18,10 @@ use crate::render::line_utils::prefix_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::InsetRenderable;
 use crate::render::renderable::Renderable;
+use crate::render::syntax;
+use crate::render::syntax::DiffLineType;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::protocol::FileChange;
-
-// Internal representation for diff line rendering
-enum DiffLineType {
-    Insert,
-    Delete,
-    Context,
-}
 
 pub struct DiffSummary {
     changes: HashMap<PathBuf, FileChange>,
@@ -42,13 +37,13 @@ impl DiffSummary {
 impl Renderable for FileChange {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let mut lines = vec![];
-        render_change(self, &mut lines, area.width as usize);
+        render_change(self, &mut lines, area.width as usize, None);
         Paragraph::new(lines).render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
         let mut lines = vec![];
-        render_change(self, &mut lines, width as usize);
+        render_change(self, &mut lines, width as usize, None);
         lines.len() as u16
     }
 }
@@ -185,15 +180,26 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
             out.push(RtLine::from(header));
         }
 
+        let extension = r
+            .move_path
+            .as_deref()
+            .unwrap_or(&r.path)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str);
         let mut lines = vec![];
-        render_change(&r.change, &mut lines, wrap_cols - 4);
+        render_change(&r.change, &mut lines, wrap_cols - 4, extension);
         out.extend(prefix_lines(lines, "    ".into(), "    ".into()));
     }
 
     out
 }
 
-fn render_change(change: &FileChange, out: &mut Vec<RtLine<'static>>, width: usize) {
+fn render_change(
+    change: &FileChange,
+    out: &mut Vec<RtLine<'static>>,
+    width: usize,
+    extension: Option<&str>,
+) {
     match change {
         FileChange::Add { content } => {
             let line_number_width = line_number_width(content.lines().count());
@@ -204,6 +210,7 @@ fn render_change(change: &FileChange, out: &mut Vec<RtLine<'static>>, width: usi
                     raw,
                     width,
                     line_number_width,
+                    extension,
                 ));
             }
         }
@@ -216,6 +223,7 @@ fn render_change(change: &FileChange, out: &mut Vec<RtLine<'static>>, width: usi
                     raw,
                     width,
                     line_number_width,
+                    extension,
                 ));
             }
         }
@@ -265,6 +273,7 @@ fn render_change(change: &FileChange, out: &mut Vec<RtLine<'static>>, width: usi
                                     s,
                                     width,
                                     line_number_width,
+                                    extension,
                                 ));
                                 new_ln += 1;
                             }
@@ -276,6 +285,7 @@ fn render_change(change: &FileChange, out: &mut Vec<RtLine<'static>>, width: usi
                                     s,
                                     width,
                                     line_number_width,
+                                    extension,
                                 ));
                                 old_ln += 1;
                             }
@@ -287,6 +297,7 @@ fn render_change(change: &FileChange, out: &mut Vec<RtLine<'static>>, width: usi
                                     s,
                                     width,
                                     line_number_width,
+                                    extension,
                                 ));
                                 old_ln += 1;
                                 new_ln += 1;
@@ -359,57 +370,38 @@ fn push_wrapped_diff_line(
     text: &str,
     width: usize,
     line_number_width: usize,
+    extension: Option<&str>,
 ) -> Vec<RtLine<'static>> {
     let ln_str = line_number.to_string();
-    let mut remaining_text: &str = text;
 
     // Reserve a fixed number of spaces (equal to the widest line number plus a
     // trailing spacer) so the sign column stays aligned across the diff block.
     let gutter_width = line_number_width.max(1);
     let prefix_cols = gutter_width + 1;
 
-    let mut first = true;
-    let (sign_char, line_style) = match kind {
-        DiffLineType::Insert => ('+', style_add()),
-        DiffLineType::Delete => ('-', style_del()),
-        DiffLineType::Context => (' ', style_context()),
+    let sign_char = match kind {
+        DiffLineType::Insert => '+',
+        DiffLineType::Delete => '-',
+        DiffLineType::Context => ' ',
     };
+    let sign_style = sign_style(kind);
     let mut lines: Vec<RtLine<'static>> = Vec::new();
+    let available_content_cols = width.saturating_sub(prefix_cols + 1).max(1);
+    let syntax_spans = syntax::highlight_line(text, extension);
+    let wrapped_spans = syntax::wrap_syntax_spans(syntax_spans, available_content_cols);
 
-    loop {
-        // Fit the content for the current terminal row:
-        // compute how many columns are available after the prefix, then split
-        // at a UTF-8 character boundary so this row's chunk fits exactly.
-        let available_content_cols = width.saturating_sub(prefix_cols + 1).max(1);
-        let split_at_byte_index = remaining_text
-            .char_indices()
-            .nth(available_content_cols)
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| remaining_text.len());
-        let (chunk, rest) = remaining_text.split_at(split_at_byte_index);
-        remaining_text = rest;
-
-        if first {
-            // Build gutter (right-aligned line number plus spacer) as a dimmed span
-            let gutter = format!("{ln_str:>gutter_width$} ");
-            // Content with a sign ('+'/'-'/' ') styled per diff kind
-            let content = format!("{sign_char}{chunk}");
-            lines.push(RtLine::from(vec![
-                RtSpan::styled(gutter, style_gutter()),
-                RtSpan::styled(content, line_style),
-            ]));
-            first = false;
+    for (idx, line_spans) in wrapped_spans.into_iter().enumerate() {
+        let gutter = if idx == 0 {
+            format!("{ln_str:>gutter_width$} ")
         } else {
-            // Continuation lines keep a space for the sign column so content aligns
-            let gutter = format!("{:gutter_width$}  ", "");
-            lines.push(RtLine::from(vec![
-                RtSpan::styled(gutter, style_gutter()),
-                RtSpan::styled(chunk.to_string(), line_style),
-            ]));
+            format!("{:gutter_width$}  ", "")
+        };
+        let mut spans = vec![RtSpan::styled(gutter, style_gutter())];
+        if idx == 0 {
+            spans.push(RtSpan::styled(sign_char.to_string(), sign_style));
         }
-        if remaining_text.is_empty() {
-            break;
-        }
+        spans.extend(syntax::merge_diff_and_syntax_styles(kind, line_spans));
+        lines.push(RtLine::from(spans));
     }
     lines
 }
@@ -436,6 +428,18 @@ fn style_add() -> Style {
 
 fn style_del() -> Style {
     Style::default().fg(Color::Red)
+}
+
+fn sign_style(kind: DiffLineType) -> Style {
+    let mut style = match kind {
+        DiffLineType::Insert => style_add(),
+        DiffLineType::Delete => style_del(),
+        DiffLineType::Context => style_context(),
+    };
+    if let Some(bg) = syntax::diff_background(kind) {
+        style = style.bg(bg);
+    }
+    style
 }
 
 #[cfg(test)]
@@ -508,8 +512,14 @@ mod tests {
         let long_line = "this is a very long line that should wrap across multiple terminal columns and continue";
 
         // Call the wrapping function directly so we can precisely control the width
-        let lines =
-            push_wrapped_diff_line(1, DiffLineType::Insert, long_line, 80, line_number_width(1));
+        let lines = push_wrapped_diff_line(
+            1,
+            DiffLineType::Insert,
+            long_line,
+            80,
+            line_number_width(1),
+            None,
+        );
 
         // Render into a small terminal to capture the visual layout
         snapshot_lines("wrap_behavior_insert", lines, 90, 8);
